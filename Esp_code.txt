@@ -1,0 +1,1001 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <ArduinoJson.h>
+#include "time.h"
+#include "img_converters.h"
+#include "driver/ledc.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED display configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+#define OLED_SDA 15
+#define OLED_SCL 14
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Camera pins for ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// WiFi credentials - replace with your network info
+const char* ssid = "dell";
+const char* password = "12345678";
+
+// Supabase configuration
+const char* SUPABASE_URL = "https://wrktsadpbrocmuyuztxl.supabase.co";
+const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indya3RzYWRwYnJvY211eXV6dHhsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEzNjcwMzMsImV4cCI6MjA1Njk0MzAzM30.EDH66keNiSQB6wvsYJ-STKPQgIBRNj9QG7sAH0Xvm3s";
+const char* SUPABASE_BUCKET_ID = "img";
+
+// Disease detection table
+const char* DISEASE_TABLE = "disease_detections";
+
+// Power management configuration
+#define ENABLE_POWER_SAVING true
+
+// Image capture and prediction settings
+const unsigned long captureInterval = 15000; // 5 seconds between captures
+const unsigned long fetchInterval = 10000;  // 10 seconds between prediction fetches
+unsigned long lastCaptureTime = 0;
+unsigned long lastFetchTime = 0;
+#define IMAGE_QUALITY 20  // Lower is better quality, range 0-63
+#define IMAGE_SIZE FRAMESIZE_VGA // Reduced resolution (640x480)
+
+// LED Indicator control
+#define LED_PIN 4  // GPIO pin for flash LED
+#define LED_INTENSITY 2  // Very low intensity (0-255)
+
+// LEDC configuration
+ledc_channel_config_t ledc_channel;
+ledc_timer_config_t ledc_timer;
+
+// Button configuration to trigger immediate capture
+#define BUTTON_PIN 13 // GPIO pin for button
+bool buttonPressed = false;
+
+// Image counter stored in EEPROM
+int imageCounter = 0;
+#define EEPROM_SIZE 4
+
+// NTP server for timestamps
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0;
+const int daylightOffset_sec = 3600;
+
+// OLED connection status flag
+bool oledConnected = false;
+
+// Latest disease detection result
+String latestImageId = "";
+String latestDisease = "No detection yet";
+float latestConfidence = 0.0;
+String latestTimestamp = "";
+
+// Function prototypes
+bool initCamera();
+bool connectToWiFi();
+String getCurrentTime();
+bool captureAndUploadImage();
+bool uploadToSupabase(const uint8_t* imageData, size_t imageSize, String fileName);
+bool fetchLatestPrediction();
+void setupLED();
+void turnOnLED();
+void turnOffLED();
+void IRAM_ATTR buttonISR();
+bool initOLED();
+void displayMessage(String line1, String line2 = "", String line3 = "", String line4 = "");
+void displayPrediction();
+void updateProgress(int progress, String message);
+bool scanI2CDevices();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32-CAM Smart Glasses - Plant Disease Detection");
+  
+  // Initialize the LED pin as output first
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW); // Ensure LED is off
+  
+  // Initialize PWM for the LED
+  setupLED();
+  
+  // Initialize button with interrupt
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+
+  // Initialize I2C for OLED with lower clock speed
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(100000); // Set to 100kHz for more reliable communication
+  
+  // Scan for I2C devices
+  scanI2CDevices();
+  
+  // Initialize OLED
+  if (!initOLED()) {
+    Serial.println("OLED initialization failed - continuing without display");
+    oledConnected = false;
+  } else {
+    oledConnected = true;
+    displayMessage("ESP32-CAM", "Smart Glasses", "Initializing...");
+  }
+
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  imageCounter = EEPROM.read(0);
+  Serial.printf("Starting with image counter: %d\n", imageCounter);
+  if (oledConnected) {
+    displayMessage("Image counter:", String(imageCounter));
+  }
+  delay(1000);
+
+  // Add delay for system stabilization
+  delay(1000);
+
+  // Initialize camera
+  if (oledConnected) {
+    displayMessage("Initializing", "Camera...");
+  }
+  if (!initCamera()) {
+    Serial.println("Camera initialization failed");
+    if (oledConnected) {
+      displayMessage("Camera Init", "FAILED!", "Restarting...");
+    }
+    delay(3000);
+    ESP.restart();
+  } else {
+    Serial.println("Camera initialized successfully");
+    if (oledConnected) {
+      displayMessage("Camera", "Initialized!");
+    }
+  }
+
+  // Connect to WiFi
+  if (oledConnected) {
+    displayMessage("Connecting to", String(ssid), "WiFi network...");
+  }
+  if (!connectToWiFi()) {
+    Serial.println("WiFi connection failed");
+    if (oledConnected) {
+      displayMessage("WiFi Connection", "FAILED!", "Restarting...");
+    }
+    delay(3000);
+    ESP.restart();
+  } else {
+    Serial.println("WiFi connected successfully");
+    if (oledConnected) {
+      displayMessage("WiFi Connected", "IP:", WiFi.localIP().toString());
+    }
+  }
+
+  // Setup time for timestamps
+  if (oledConnected) {
+    displayMessage("Setting up", "NTP time...");
+  }
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Add delay before first capture
+  delay(2000);
+  
+  // Perform first capture after boot
+  if (oledConnected) {
+    displayMessage("Taking first", "capture...");
+  }
+  if (captureAndUploadImage()) {
+    Serial.println("Boot capture successful");
+    if (oledConnected) {
+      displayMessage("Boot capture", "successful!");
+    }
+    imageCounter++;
+    EEPROM.write(0, imageCounter);
+    EEPROM.commit();
+  } else {
+    Serial.println("Boot capture failed");
+    if (oledConnected) {
+      displayMessage("Boot capture", "failed!");
+    }
+  }
+  
+  // Fetch initial prediction data
+  if (oledConnected) {
+    displayMessage("Fetching initial", "prediction data...");
+  }
+  if (fetchLatestPrediction()) {
+    Serial.println("Initial prediction fetch successful");
+    displayPrediction();
+  } else {
+    Serial.println("Initial prediction fetch failed");
+    if (oledConnected) {
+      displayMessage("No prediction", "data available");
+    }
+  }
+  
+  if (oledConnected) {
+    displayMessage("Running in", "continuous mode", "Waiting...");
+  }
+  Serial.println("Running in continuous mode - not going to deep sleep");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Check if button was pressed for immediate capture
+  if (buttonPressed) {
+    buttonPressed = false;
+    Serial.println("Button pressed - capturing image");
+    if (oledConnected) {
+      displayMessage("Button pressed", "Capturing...");
+    }
+    
+    if (captureAndUploadImage()) {
+      Serial.println("Button-triggered capture successful");
+      if (oledConnected) {
+        displayMessage("Button capture", "successful!");
+      }
+      imageCounter++;
+      EEPROM.write(0, imageCounter);
+      EEPROM.commit();
+      
+      // Wait a moment for processing on server side
+      delay(2000);
+      
+      // Try to fetch the latest prediction
+      if (fetchLatestPrediction()) {
+        displayPrediction();
+      } else {
+        if (oledConnected) {
+          displayMessage("Waiting for", "prediction...");
+        }
+      }
+    } else {
+      Serial.println("Button-triggered capture failed");
+      if (oledConnected) {
+        displayMessage("Button capture", "failed!");
+      }
+    }
+  }
+
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, trying to reconnect...");
+    if (oledConnected) {
+      displayMessage("WiFi disconnected", "Reconnecting...");
+    }
+    connectToWiFi();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi reconnected successfully");
+      if (oledConnected) {
+        displayMessage("WiFi reconnected", "IP:", WiFi.localIP().toString());
+      }
+    } else {
+      Serial.println("WiFi reconnect failed");
+      if (oledConnected) {
+        displayMessage("WiFi reconnect", "failed!");
+      }
+    }
+  }
+
+  // Interval-based capture
+  if (currentMillis - lastCaptureTime >= captureInterval) {
+    lastCaptureTime = currentMillis;
+    Serial.println("Auto capture starting...");
+    if (oledConnected) {
+      displayMessage("Auto capture", "in progress...");
+    }
+
+    if (captureAndUploadImage()) {
+      Serial.println("Interval capture successful");
+      if (oledConnected) {
+        displayMessage("Auto capture", "successful!");
+      }
+      imageCounter++;
+      EEPROM.write(0, imageCounter);
+      EEPROM.commit();
+    } else {
+      Serial.println("Interval capture failed");
+      if (oledConnected) {
+        displayMessage("Auto capture", "failed!");
+      }
+    }
+  }
+  
+  // Interval-based prediction fetch
+  if (currentMillis - lastFetchTime >= fetchInterval) {
+    lastFetchTime = currentMillis;
+    
+    if (oledConnected) {
+      displayMessage("Fetching latest", "prediction...");
+    }
+    
+    if (fetchLatestPrediction()) {
+      Serial.println("Prediction fetch successful");
+      displayPrediction();
+    } else {
+      Serial.println("Prediction fetch failed or no new data");
+      if (oledConnected) {
+        displayMessage("No new prediction", "data available");
+      }
+    }
+  }
+
+  delay(100);
+}
+
+// New function to display the prediction result
+void displayPrediction() {
+  if (!oledConnected) return;
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Display disease name
+  display.setCursor(0, 0);
+  display.print("Disease: ");
+  
+  // Handle long disease names
+  if (latestDisease.length() > 14) {
+    display.println(latestDisease.substring(0, 14));
+    display.setCursor(0, 10);
+    display.println(latestDisease.substring(14));
+  } else {
+    display.println(latestDisease);
+  }
+  
+  // Display confidence
+  display.setCursor(0, 24);
+  display.print("Confidence: ");
+  display.print(latestConfidence, 1);
+  display.println("%");
+  
+  // Display time
+  display.setCursor(0, 40);
+  display.print("Time: ");
+  display.println(latestTimestamp);
+  
+  // Display image counter
+  display.setCursor(0, 50);
+  display.print("Images: ");
+  display.println(imageCounter);
+  
+  display.display();
+}
+
+// New function to scan for I2C devices
+bool scanI2CDevices() {
+  byte error, address;
+  int nDevices = 0;
+  
+  Serial.println("Scanning I2C bus...");
+  
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      nDevices++;
+      
+      // Check if this is our OLED display
+      if (address == SCREEN_ADDRESS) {
+        Serial.println("Found OLED display at expected address!");
+      }
+    }
+  }
+  
+  if (nDevices == 0) {
+    Serial.println("No I2C devices found");
+    return false;
+  } else {
+    Serial.printf("Found %d I2C device(s)\n", nDevices);
+    return true;
+  }
+}
+
+// Initialize OLED display with error handling
+bool initOLED() {
+  Serial.println("Attempting to initialize OLED display...");
+  
+  // Try with specified address first
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed with primary address, trying alternate...");
+    
+    // Try alternate address (some displays use 0x3D instead of 0x3C)
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("SSD1306 allocation failed with alternate address");
+      return false;
+    }
+  }
+
+  // Initial setup
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  
+  // Display connection info without string concatenation
+  display.println(F("OLED Connected"));
+  display.println(F("GND: Connect to GND"));
+  display.println(F("VCC: Connect to 3.3V"));
+  
+  // Safer way to display GPIO pin info
+  display.print(F("SCL: GPIO "));
+  display.println(OLED_SCL);
+  display.print(F("SDA: GPIO "));
+  display.println(OLED_SDA);
+  
+  display.display();
+  delay(2000);
+  
+  Serial.println("OLED initialized successfully");
+  return true;
+}
+
+// Display message on OLED (up to 4 lines) with check for OLED connection
+void displayMessage(String line1, String line2, String line3, String line4) {
+  if (!oledConnected) return;  // Skip if OLED is not connected
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println(line1);
+  
+  if (line2.length() > 0) {
+    display.setCursor(0, 16);
+    display.println(line2);
+  }
+  
+  if (line3.length() > 0) {
+    display.setCursor(0, 32);
+    display.println(line3);
+  }
+  
+  if (line4.length() > 0) {
+    display.setCursor(0, 48);
+    display.println(line4);
+  }
+  
+  display.display();
+}
+
+// Display progress bar on OLED with check for OLED connection
+void updateProgress(int progress, String message) {
+  if (!oledConnected) return;  // Skip if OLED is not connected
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Display message
+  display.setCursor(0, 0);
+  display.println(message);
+  
+  // Draw progress bar
+  display.drawRect(0, 20, 128, 10, SSD1306_WHITE);
+  display.fillRect(2, 22, (progress * 124) / 100, 6, SSD1306_WHITE);
+  
+  // Display percentage
+  display.setCursor(0, 40);
+  display.print(progress);
+  display.print("%");
+  
+  display.display();
+}
+
+// Setup PWM for LED indicator using ESP-IDF API
+void setupLED() {
+  // Configure timer
+  ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
+  ledc_timer.duty_resolution = LEDC_TIMER_8_BIT;  // 8-bit resolution (0-255)
+  ledc_timer.timer_num = LEDC_TIMER_0;
+  ledc_timer.freq_hz = 5000;  // 5kHz frequency
+  ledc_timer_config(&ledc_timer);
+  
+  // Configure channel
+  ledc_channel.gpio_num = LED_PIN;
+  ledc_channel.speed_mode = LEDC_LOW_SPEED_MODE;
+  ledc_channel.channel = LEDC_CHANNEL_0;
+  ledc_channel.timer_sel = LEDC_TIMER_0;
+  ledc_channel.intr_type = LEDC_INTR_DISABLE;
+  ledc_channel.duty = 0;  // Initially off
+  ledc_channel_config(&ledc_channel);
+  
+  Serial.println("LED indicator setup complete");
+}
+
+// Turn on LED with low intensity
+void turnOnLED() {
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LED_INTENSITY);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+// Turn off LED
+void turnOffLED() {
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+// ISR for button press
+void IRAM_ATTR buttonISR() {
+  buttonPressed = true;
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_1; // Changed to 1 since 0 is used for LED
+  config.ledc_timer = LEDC_TIMER_1;     // Also changed to a different timer
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  
+  // Lower clock frequency for stability
+  config.xclk_freq_hz = 10000000; // 10MHz
+  
+  // Use RGB565 format since JPEG isn't supported
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = IMAGE_SIZE;
+  config.jpeg_quality = IMAGE_QUALITY;
+  
+  // Single frame buffer for memory stability
+  config.fb_count = 1;
+  
+  // Simple grab mode
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
+  }
+
+  // Get camera sensor and adjust settings
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    // Set frame size
+    s->set_framesize(s, IMAGE_SIZE);
+    
+    // Basic settings
+    s->set_brightness(s, 0);      // Default brightness
+    s->set_contrast(s, 0);        // Default contrast
+    s->set_saturation(s, 0);      // Normal saturation
+    
+    // Default mirror/flip settings
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+    
+    // Auto settings
+    s->set_whitebal(s, 1);        // Enable auto white balance
+    s->set_gain_ctrl(s, 1);       // Enable auto gain
+    s->set_exposure_ctrl(s, 1);   // Enable auto exposure
+  }
+
+  Serial.println("Camera initialized successfully");
+  return true;
+}
+
+bool connectToWiFi() {
+  Serial.printf("Connecting to %s ", ssid);
+  WiFi.begin(ssid, password);
+
+  // Try for 20 seconds to connect to WiFi
+  int timeout = 20;
+  while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+    delay(1000);
+    Serial.print(".");
+    if (oledConnected) {
+      updateProgress(100 - (timeout * 5), "Connecting to WiFi: " + String(ssid));
+    }
+    timeout--;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Failed to connect to WiFi");
+    return false;
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Power saving for WiFi if enabled
+  if (ENABLE_POWER_SAVING) {
+    WiFi.setSleep(true);
+  }
+  
+  return true;
+}
+
+String getCurrentTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return "unknown-time";
+  }
+
+  char timeString[30];
+  strftime(timeString, sizeof(timeString), "%Y%m%d-%H%M%S", &timeinfo);
+  return String(timeString);
+}
+
+bool captureAndUploadImage() {
+  Serial.println("Preparing for capture...");
+  if (oledConnected) {
+    displayMessage("Preparing", "for capture...");
+  }
+  
+  // Turn on LED indicator with low intensity
+  turnOnLED();
+  delay(200); // Allow exposure to adjust
+  
+  // Capture the image
+  camera_fb_t * fb = esp_camera_fb_get();
+  
+  // Turn off LED immediately after capture
+  turnOffLED();
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    if (oledConnected) {
+      displayMessage("Camera capture", "FAILED!");
+    }
+    return false;
+  }
+
+  Serial.printf("Image captured! Size: %zu bytes\n", fb->len);
+  if (oledConnected) {
+    displayMessage("Image captured!", "Size: " + String(fb->len) + " bytes");
+  }
+  
+  // Convert RGB565 to JPEG
+  uint8_t * jpg_buf = NULL;
+  size_t jpg_size = 0;
+  
+  if (oledConnected) {
+    displayMessage("Converting to JPEG", "Please wait...");
+  }
+  bool converted = frame2jpg(fb, IMAGE_QUALITY, &jpg_buf, &jpg_size);
+  
+  if (!converted) {
+    Serial.println("JPEG conversion failed");
+    if (oledConnected) {
+      displayMessage("JPEG conversion", "FAILED!");
+    }
+    esp_camera_fb_return(fb);
+    return false;
+  }
+  
+  Serial.printf("Converted to JPEG: %zu bytes\n", jpg_size);
+  if (oledConnected) {
+    displayMessage("Converted to JPEG", "Size: " + String(jpg_size) + " bytes");
+  }
+  
+  // Briefly turn on LED to indicate upload start
+  turnOnLED();
+  
+  // Generate unique filename with timestamp
+  String timestamp = getCurrentTime();
+  String fileName = "PlantScan_" + timestamp + "_" + String(imageCounter) + ".jpg";
+  
+  // Store latest image filename for prediction lookup
+  latestImageId = fileName;
+  
+  // Upload the JPEG data
+  if (oledConnected) {
+    displayMessage("Uploading image", fileName, "to Supabase...");
+  }
+  bool success = uploadToSupabase(jpg_buf, jpg_size, fileName);
+  
+  // Turn off LED after upload
+  turnOffLED();
+  
+  // Free the JPEG buffer
+  free(jpg_buf);
+  
+  // Return the frame buffer to the driver for reuse
+  esp_camera_fb_return(fb);
+  
+  // Blink LED briefly to indicate success or failure
+  if (success) {
+    // Two quick blinks for success
+    if (oledConnected) {
+      displayMessage("Upload", "SUCCESSFUL!");
+    }
+    for (int i = 0; i < 2; i++) {
+      turnOnLED();
+      delay(100);
+      turnOffLED();
+      delay(100);
+    }
+  } else {
+    // One long blink for failure
+    if (oledConnected) {
+      displayMessage("Upload", "FAILED!");
+    }
+    turnOnLED();
+    delay(500);
+    turnOffLED();
+  }
+  
+  return success;
+}
+
+bool uploadToSupabase(const uint8_t* imageData, size_t imageSize, String fileName) {
+  Serial.printf("Uploading image %s to Supabase... Size: %d bytes\n", fileName.c_str(), imageSize);
+
+  HTTPClient http;
+  
+  // Format the URL using String objects 
+  String url = String(SUPABASE_URL) + "/storage/v1/object/" + String(SUPABASE_BUCKET_ID) + "/" + fileName;
+  
+  http.begin(url);
+  
+  // Headers for Supabase upload
+  http.addHeader("Content-Type", "image/jpeg");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+  
+  // Add metadata tag for plant disease detection
+  http.addHeader("x-upsert", "true"); 
+  
+  http.setTimeout(60000); // 60 seconds timeout for slower connections
+
+  // Show upload progress on OLED
+  if (oledConnected) {
+    displayMessage("Uploading to", "Supabase...", "Please wait");
+  }
+  
+  int httpCode = http.PUT((uint8_t*)imageData, imageSize);
+
+  if (httpCode == 200 || httpCode == 201) {
+    String payload = http.getString();
+    Serial.println("Upload successful!");
+    if (oledConnected) {
+      displayMessage("Upload successful!", "HTTP code: " + String(httpCode));
+    }
+    http.end();
+    return true;
+  } else {
+    String payload = http.getString();
+    Serial.printf("Upload failed, HTTP code: %d\n", httpCode);
+    Serial.println("Error response: " + payload);
+    if (oledConnected) {
+      displayMessage("Upload failed!", "HTTP code: " + String(httpCode));
+    }
+    http.end();
+    return false;
+  }
+}
+
+// New function to fetch prediction data from Supabase
+bool fetchLatestPrediction() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, can't fetch prediction");
+    return false;
+  }
+
+  Serial.println("Fetching latest prediction from Supabase...");
+  
+  HTTPClient http;
+  
+  // Update column names to match your actual database schema
+  String url = String(SUPABASE_URL) + "/rest/v1/" + String(DISEASE_TABLE);
+  url += "?select=file_name,prediction,timestamp,id&order=timestamp.desc&limit=1";
+  
+  http.begin(url);
+  
+  // Headers for Supabase API
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=representation");
+  
+  int httpCode = http.GET();
+  String payload = "";
+  
+  if (httpCode == 200) {
+    payload = http.getString();
+    Serial.println("Fetch successful: " + payload);
+    
+    // Parse JSON response
+    const size_t capacity = JSON_ARRAY_SIZE(1) + JSON_OBJECT_SIZE(4) + 120;
+    DynamicJsonDocument doc(capacity);
+    
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (error) {
+      Serial.print("JSON parsing failed: ");
+      Serial.println(error.c_str());
+      http.end();
+      return false;
+    }
+    
+    // Check if we received any results
+    if (doc.size() == 0) {
+      Serial.println("No prediction data available");
+      http.end();
+      return false;
+    }
+    
+    // Extract prediction data using the correct column names
+    JsonObject obj = doc[0];
+    String imageId = obj["file_name"].as<String>();
+    String diseaseName = obj["prediction"].as<String>();
+    
+    // You might need to adjust this if confidence is stored differently or not available
+    float confidence = 100.0; // Default if not available
+    
+    // Get timestamp from the correct column
+    String timestamp = obj["timestamp"].as<String>();
+    
+    // Format the timestamp
+    if (timestamp.length() > 16) {
+      timestamp = timestamp.substring(11, 16); // Just keep the time HH:MM
+    }
+    
+    // Check if this is new data
+    if (imageId != latestImageId && imageId.length() > 0) {
+      Serial.println("New prediction received!");
+      
+      // Update stored values
+      latestImageId = imageId;
+      latestDisease = diseaseName;
+      latestConfidence = confidence;
+      latestTimestamp = timestamp;
+      
+      http.end();
+      return true;
+    } else if (imageId.length() > 0) {
+      // Same image but update the data anyway
+      latestDisease = diseaseName;
+      latestConfidence = confidence;
+      latestTimestamp = timestamp;
+      
+      http.end();
+      return true;
+    }
+    
+    http.end();
+    return false;
+  } else {
+    Serial.printf("Fetch failed, HTTP code: %d\n", httpCode);
+    payload = http.getString();
+    Serial.println("Error: " + payload);
+    
+    http.end();
+    return false;
+  }
+}
+
+// Function to enter low power mode
+void enterLowPowerMode() {
+  if (!ENABLE_POWER_SAVING) return;
+  
+  Serial.println("Entering low power mode...");
+  
+  // Turn off camera
+  esp_camera_deinit();
+  
+  // Reduce CPU frequency
+  setCpuFrequencyMhz(80); // Reduce from default 240MHz to 80MHz
+  
+  // Deep sleep not used in continuous mode but power optimizations are still applied
+  
+  Serial.println("Power saving mode active");
+}
+
+// Function to exit low power mode
+void exitLowPowerMode() {
+  if (!ENABLE_POWER_SAVING) return;
+  
+  Serial.println("Exiting low power mode...");
+  
+  // Restore CPU frequency
+  setCpuFrequencyMhz(240);
+  
+  // Reinitialize camera
+  initCamera();
+  
+  Serial.println("Normal power mode restored");
+}
+
+// Handles errors by displaying message and optionally restarting
+void handleError(String errorMessage, bool restart = false) {
+  Serial.println("ERROR: " + errorMessage);
+  
+  if (oledConnected) {
+    displayMessage("ERROR", errorMessage, restart ? "Restarting..." : "");
+  }
+  
+  if (restart) {
+    delay(3000);
+    ESP.restart();
+  }
+}
+
+// Reconnect to WiFi if disconnected
+bool ensureWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi reconnecting...");
+    
+    if (oledConnected) {
+      displayMessage("WiFi disconnected", "Reconnecting...");
+    }
+    
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(ssid, password);
+    
+    // Try for 10 seconds
+    int timeout = 10;
+    while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+      delay(1000);
+      Serial.print(".");
+      timeout--;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi reconnected");
+      if (oledConnected) {
+        displayMessage("WiFi reconnected", WiFi.localIP().toString());
+      }
+      return true;
+    } else {
+      Serial.println("WiFi reconnect failed");
+      if (oledConnected) {
+        displayMessage("WiFi reconnect", "failed!");
+      }
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+// A helper function to log and display debug info
+void logDebug(String message, bool showOnOled = false) {
+  Serial.println(message);
+  
+  if (oledConnected && showOnOled) {
+    displayMessage("DEBUG", message);
+  }
+}
+
+// End of file
